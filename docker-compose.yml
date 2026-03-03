@@ -1,0 +1,198 @@
+# docker-compose.yml
+# Orquestra toda a infraestrutura do projeto localmente.
+# Comando para subir tudo: docker-compose up -d
+# Comando para derrubar tudo: docker-compose down
+# Para ver os logs de um serviço: docker-compose logs -f kafka
+
+version: '3.8'
+
+# Rede interna criada automaticamente pelo Compose.
+# Todos os serviços abaixo se enxergam pelo nome do serviço (ex: "kafka", "postgres").
+# Fora dos containers (sua máquina), você acessa pelos "ports" mapeados.
+
+services:
+
+  # ============================================================
+  # POSTGRESQL
+  # Banco de dados relacional usado pelos dois microsserviços.
+  # ============================================================
+  postgres:
+    image: postgres:15
+    container_name: ons-postgres  # ons = order-notification-system
+    environment:
+      POSTGRES_DB: orderdb         # Nome do banco criado automaticamente na inicialização
+      POSTGRES_USER: user          # Usuário do banco
+      POSTGRES_PASSWORD: pass      # Senha do banco
+    ports:
+      - "5432:5432"                # Expõe para sua máquina — permite conectar via DBeaver, etc.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data  # Persiste os dados entre restarts do container
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U user -d orderdb" ]
+      interval: 10s   # Verifica a cada 10 segundos
+      timeout: 5s     # Timeout de 5 segundos por verificação
+      retries: 5      # Considera unhealthy após 5 falhas consecutivas
+
+  # ============================================================
+  # REDIS
+  # Cache em memória usado pelo notification-service.
+  # ============================================================
+  redis:
+    image: redis:7
+    container_name: ons-redis
+    ports:
+      - "6379:6379"                # Expõe para sua máquina — permite conectar via redis-cli
+    volumes:
+      - redis_data:/data           # Persiste os dados entre restarts (opcional para cache, mas útil em dev)
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================
+  # ZOOKEEPER
+  # Serviço de coordenação exigido pelo Kafka.
+  # Você não interage com ele diretamente.
+  # ============================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: ons-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181  # Porta padrão que o Kafka usa para se conectar ao Zookeeper
+      ZOOKEEPER_TICK_TIME: 2000    # Intervalo de heartbeat em ms — define timeouts internos
+    healthcheck:
+      test: [ "CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================
+  # KAFKA
+  # Broker de mensagens — coração do projeto.
+  # Depende do Zookeeper para gerenciar metadados do cluster.
+  # ============================================================
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: ons-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy  # Só sobe quando o Zookeeper estiver realmente pronto
+    ports:
+      - "9092:9092"                # Porta exposta para sua máquina (acesso externo aos containers)
+    environment:
+      KAFKA_BROKER_ID: 1           # ID único do broker — importante em clusters com múltiplos brokers
+
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181  # Endereço do Zookeeper — usa o nome do serviço na rede interna
+
+      # LISTENERS define em quais endereços o Kafka aceita conexões:
+      # - PLAINTEXT: para conexões vindas de FORA dos containers (sua máquina, testes locais)
+      # - PLAINTEXT_INTERNAL: para conexões vindas de DENTRO da rede Docker (outros containers)
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092
+
+      # ADVERTISED_LISTENERS é o endereço que o Kafka anuncia para os clientes se conectarem:
+      # - Clientes externos (sua máquina) usam localhost:9092
+      # - Clientes internos (order-service, notification-service) usam kafka:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+
+      # Mapeia os nomes dos listeners para os protocolos de segurança
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+
+      # Qual listener os outros brokers usam para se comunicar entre si
+      # Em desenvolvimento com um único broker, usamos o listener interno
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+
+      # Fator de replicação dos tópicos internos do Kafka
+      # Em produção seria >= 3 (um por broker). Com 1 broker local, usamos 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # Cria os tópicos automaticamente se não existirem ao publicar/consumir
+      # Em produção é comum desabilitar e criar tópicos explicitamente
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    healthcheck:
+      test: [ "CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092" ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ============================================================
+  # KAFKA UI
+  # Interface visual para inspecionar tópicos, mensagens e consumers.
+  # Acesse em: http://localhost:8090
+  # Muito útil para debugar o fluxo de eventos durante o desenvolvimento.
+  # ============================================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: ons-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092  # Usa o listener interno
+
+  # ============================================================
+  # ORDER-SERVICE
+  # Microsserviço que gerencia pedidos.
+  # ============================================================
+  order-service:
+    build:
+      context: ./order-service          # Pasta onde está o Dockerfile
+      dockerfile: Dockerfile
+    container_name: ons-order-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      # Sobrescreve as propriedades do application.yml dentro do container
+      # Usa os nomes dos serviços como host (não localhost)
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/orderdb
+      SPRING_DATASOURCE_USERNAME: user
+      SPRING_DATASOURCE_PASSWORD: pass
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092  # Listener interno
+    # Útil durante desenvolvimento: reinicia automaticamente se o serviço cair
+    restart: on-failure
+
+  # ============================================================
+  # NOTIFICATION-SERVICE
+  # Microsserviço que consome eventos e gera notificações.
+  # ============================================================
+  notification-service:
+    build:
+      context: ./notification-service
+      dockerfile: Dockerfile
+    container_name: ons-notification-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/orderdb
+      SPRING_DATASOURCE_USERNAME: user
+      SPRING_DATASOURCE_PASSWORD: pass
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+    restart: on-failure
+
+# ============================================================
+# VOLUMES
+# Armazenamento persistente fora dos containers.
+# Sem volumes, todos os dados são perdidos ao rodar "docker-compose down".
+# ============================================================
+volumes:
+  postgres_data:
+  redis_data:
