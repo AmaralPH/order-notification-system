@@ -13,7 +13,7 @@ import java.util.UUID;
 @Getter
 @Builder
 @NoArgsConstructor
-@AllArgsConstructor
+@AllArgsConstructor(access = AccessLevel.PRIVATE)
 public class Order {
 
     @Id
