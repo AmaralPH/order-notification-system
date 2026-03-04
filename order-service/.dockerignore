@@ -1,0 +1,23 @@
+# .dockerignore
+# Arquivos e pastas que o Docker deve ignorar ao fazer o build.
+# Funciona como o .gitignore — evita copiar arquivos desnecessários para o contexto de build.
+# Resultado: build mais rápido e imagem mais limpa.
+
+# Pasta de build do Maven — o Docker vai compilar do zero no Stage 1
+target/
+
+# Arquivos do Git — não precisam ir para a imagem
+.git/
+.gitignore
+
+# Arquivos do ambiente de desenvolvimento
+.idea/
+*.iml
+.vscode/
+
+# Arquivos de documentação
+*.md
+docs/
+
+# Arquivos de teste locais
+*.env.local
